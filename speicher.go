@@ -7,7 +7,7 @@
 //	import (
 //		"fmt"
 //
-//		"github.com/tsukinoko-kun/speicher"
+//		"github.com/bloodmagesoftware/speicher"
 //	)
 //
 //	type Foo struct {
