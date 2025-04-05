@@ -223,7 +223,7 @@ func loadListFromJsonFile[T any](location string) (List[T], error) {
 			err = os.MkdirAll(filepath.Dir(location), 0740)
 			return l, err
 		}
-		return nil, errors.Join(fmt.Errorf("failed to open file '%s'", location), err)
+		return nil, errors.Join(fmt.Errorf("failed to open file '%s' (file exists)", location), err)
 	}
 	decoder := json.NewDecoder(f)
 	if err := decoder.Decode(&l.data); err != nil {

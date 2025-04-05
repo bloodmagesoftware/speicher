@@ -234,14 +234,14 @@ func LoadMap[T any](location string) (Map[T], error) {
 }
 
 func loadMapFromJsonFile[T any](location string) (Map[T], error) {
-	m := &memoryMap[T]{data: make(map[string]T), location: location}
+	m := &memoryMap[T]{data: map[string]T{}, location: location}
 	f, err := os.Open(location)
 	if err != nil {
 		if os.IsNotExist(err) {
 			err = os.MkdirAll(filepath.Dir(location), 0740)
 			return m, err
 		}
-		return nil, errors.Join(fmt.Errorf("failed to open file '%s'", location), err)
+		return nil, errors.Join(fmt.Errorf("failed to open file '%s' (but exists)", location), err)
 	}
 	decoder := json.NewDecoder(f)
 	if err := decoder.Decode(&m.data); err != nil {
