@@ -47,6 +47,9 @@ type (
 		// If the key already exists, its value is overwritten.
 		Set(key string, value T)
 
+		// Delete removes the element associated with the given key.
+		Delete(key string)
+
 		// Overwrite replaces the entire data store with the provided map.
 		Overwrite(map[string]T)
 
@@ -197,6 +200,10 @@ func (m *memoryMap[T]) Has(key string) bool {
 
 func (m *memoryMap[T]) Set(key string, value T) {
 	m.data[key] = value
+}
+
+func (m *memoryMap[T]) Delete(key string) {
+	delete(m.data, key)
 }
 
 func (m *memoryMap[T]) Overwrite(values map[string]T) {
