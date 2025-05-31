@@ -61,6 +61,9 @@ type (
 		// It also returns a cancel function to stop the iteration process if needed.
 		Range() (<-chan T, func())
 
+		// Iterate iterates over the List and calls the provided function for each element.
+		Iterate(yield func(v T) bool)
+
 		// Save persists the current state of the List to its underlying data store.
 		// It returns an error if the operation fails.
 		Save() error
@@ -167,6 +170,16 @@ func (l *memoryList[T]) Range() (<-chan T, func()) {
 	}()
 
 	return ch, cancel
+}
+
+func (l *memoryList[T]) Iterate(yield func(v T) bool) {
+	l.RLock()
+	defer l.RUnlock()
+	for _, value := range l.data {
+		if !yield(value) {
+			break
+		}
+	}
 }
 
 func (l *memoryList[T]) Lock() {

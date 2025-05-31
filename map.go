@@ -59,6 +59,9 @@ type (
 		// data store, along with a cancellation function to terminate the iteration.
 		RangeV() (<-chan T, func())
 
+		// Iterate iterates over the Map and calls the provided function for each element.
+		Iterate(yield func(key string, value T) bool)
+
 		// Save persists the current state of the data store.
 		// It returns an error if the save operation fails.
 		Save() error
@@ -85,7 +88,6 @@ type (
 	}
 )
 
-// Update RangeKV method
 func (m *memoryMap[T]) RangeKV() (<-chan MapRangeEl[T], func()) {
 	ch := make(chan MapRangeEl[T])
 	done := make(chan struct{})
@@ -125,7 +127,6 @@ func (m *memoryMap[T]) RangeKV() (<-chan MapRangeEl[T], func()) {
 	return ch, cancel
 }
 
-// Update RangeV method
 func (m *memoryMap[T]) RangeV() (<-chan T, func()) {
 	ch := make(chan T)
 	done := make(chan struct{})
@@ -152,6 +153,16 @@ func (m *memoryMap[T]) RangeV() (<-chan T, func()) {
 	}()
 
 	return ch, cancel
+}
+
+func (m *memoryMap[T]) Iterate(yield func(key string, value T) bool) {
+	m.RLock()
+	defer m.RUnlock()
+	for key, value := range m.data {
+		if !yield(key, value) {
+			break
+		}
+	}
 }
 
 func (m *memoryMap[T]) Get(key string) (value T, found bool) {
