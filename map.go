@@ -159,8 +159,6 @@ func (m *memoryMap[T]) RangeV() (<-chan T, func()) {
 }
 
 func (m *memoryMap[T]) Iterate(yield func(key string, value T) bool) {
-	m.RLock()
-	defer m.RUnlock()
 	for key, value := range m.data {
 		if !yield(key, value) {
 			break

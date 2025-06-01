@@ -31,10 +31,8 @@
 //		func() {
 //			foo.RLock() // use RLock to get read access
 //			defer foo.RUnlock() // use RUnlock to release read access
-//			ch, close := foo.RangeKV() // get channel to iterate over the store
-//			defer close() // make sure the channel gets closed
-//			for el := range ch {
-//				fmt.Printf("%s => (%s, %d)\n", el.Key, el.Value.Bar, el.Value.Baz)
+//			for key, value := range foo.Iterate { // use the Iterate method to create an iterator
+//				fmt.Printf("%s => (%s, %d)\n", key, value.Bar, value.Baz)
 //			}
 //		}()
 //

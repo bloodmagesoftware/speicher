@@ -173,8 +173,6 @@ func (l *memoryList[T]) Range() (<-chan T, func()) {
 }
 
 func (l *memoryList[T]) Iterate(yield func(v T) bool) {
-	l.RLock()
-	defer l.RUnlock()
 	for _, value := range l.data {
 		if !yield(value) {
 			break
