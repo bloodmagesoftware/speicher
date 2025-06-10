@@ -59,6 +59,8 @@ type (
 
 		// Range returns a read-only channel through which the elements of the List can be iterated.
 		// It also returns a cancel function to stop the iteration process if needed.
+		//
+		// Deprecated: use Iterate if you need to iterate over the entire data store.
 		Range() (<-chan T, func())
 
 		// Iterate iterates over the List and calls the provided function for each element.

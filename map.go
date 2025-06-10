@@ -56,10 +56,14 @@ type (
 		// RangeKV returns a read-only channel that emits key-value pair elements
 		// (as MapRangeEl) from the data store, along with a cancellation function
 		// to terminate the iteration when desired.
+		//
+		// Deprecated: use Iterate if you need to iterate over the entire data store.
 		RangeKV() (<-chan MapRangeEl[T], func())
 
 		// RangeV returns a read-only channel that emits only the values stored in the
 		// data store, along with a cancellation function to terminate the iteration.
+		//
+		// Deprecated: use Iterate if you need to iterate over the entire data store.
 		RangeV() (<-chan T, func())
 
 		// Iterate iterates over the Map and calls the provided function for each element.
