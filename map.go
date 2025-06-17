@@ -24,9 +24,47 @@ type (
 		saveOnce     *sync.Once
 	}
 
+	memoryMapTx[T any] struct {
+		m          *memoryMap[T]
+		mut        sync.Mutex
+		changes    map[string]*T
+		committed  bool
+		rolledBack bool
+	}
+
+	// MapTx is a read-write transaction for the Map data store. Reading from it will return the changes made in the transaction.
+	MapTx[T any] interface {
+		// Get is same as Map.Get
+		Get(key string) (*T, bool)
+		// Find is same as Map.Find
+		Find(func(T) bool) (value *T, found bool)
+		// Has is same as Map.Has
+		Has(key string) bool
+		// Set is same as Map.Set
+		Set(key string, value T)
+		// Delete is same as Map.Delete
+		Delete(key string)
+		// Select is same as Map.Select
+		Select(where ...MapSelector[T]) func(yield func(key string, value *T) bool)
+
+		// Commit commits the changes made in the transaction. No-op if the transaction is already committed or rolled back.
+		Commit()
+		// Rollback rolls back the changes made in the transaction and makes Commit a no-op.
+		Rollback()
+	}
+
 	// Map is a thread-safe key-value data store interface that provides basic
 	// CRUD operations, predicate-based search, and iteration functionality.
 	Map[T any] interface {
+		// Begin starts a new transaction. Call Commit to write the changes to the data store. Call Rollback to discard the changes.
+		Begin() MapTx[T]
+
+		// WriteE executes the given function while holding exclusive write lock.
+		WriteE(f func(m *memoryMap[T]) (any, error)) (any, error)
+
+		// Write executes the given function while holding exclusive write lock.
+		Write(f func(m *memoryMap[T]) any) any
+
 		// Get retrieves an element associated with the given key.
 		// It returns the value and a boolean indicating whether the key exists.
 		Get(key string) (T, bool)
@@ -53,129 +91,42 @@ type (
 		// Overwrite replaces the entire data store with the provided map.
 		Overwrite(map[string]T)
 
-		// RangeKV returns a read-only channel that emits key-value pair elements
-		// (as MapRangeEl) from the data store, along with a cancellation function
-		// to terminate the iteration when desired.
-		//
-		// Deprecated: use Iterate if you need to iterate over the entire data store.
-		RangeKV() (<-chan MapRangeEl[T], func())
-
-		// RangeV returns a read-only channel that emits only the values stored in the
-		// data store, along with a cancellation function to terminate the iteration.
-		//
-		// Deprecated: use Iterate if you need to iterate over the entire data store.
-		RangeV() (<-chan T, func())
-
-		// Iterate iterates over the Map and calls the provided function for each element.
-		Iterate(yield func(key string, value T) bool)
+		// Select iterates over the Map, filters the elements, and calls the provided function for each element until the function returns false.
+		Select(where ...MapSelector[T]) func(yield func(key string, value T) bool)
 
 		// Save persists the current state of the data store.
 		// It returns an error if the save operation fails.
 		Save() error
-
-		// Lock acquires the write lock for the data store to allow safe updates.
-		// Don't forget to use Unlock when you are done.
-		Lock()
-
-		// Unlock releases the write lock for the data store.
-		Unlock()
-
-		// RLock acquires the read lock for the data store to allow safe reading.
-		// Don't forget to use RUnlock when you are done.
-		RLock()
-
-		// RUnlock releases the read lock for the data store.
-		RUnlock()
 	}
 
-	// MapRangeEl represents a key-value pair element emitted by the Map's RangeKV method.
-	MapRangeEl[T any] struct {
-		Key   string
-		Value T
-	}
+	MapSelector[T any] func(key string, value T) bool
 )
 
-func (m *memoryMap[T]) RangeKV() (<-chan MapRangeEl[T], func()) {
-	ch := make(chan MapRangeEl[T])
-	done := make(chan struct{})
-	cancel := func() {
-		select {
-		case <-done:
-			// channel already closed, no-op
-			return
-		default:
-			if done != nil {
-				close(done)
-				done = nil
-			}
-		}
-	}
-
-	go func() {
-		defer func() {
-			if done != nil {
-				close(done)
-				done = nil
-			}
-			if ch != nil {
-				close(ch)
-				ch = nil
-			}
-		}()
+func (m *memoryMap[T]) Select(where ...MapSelector[T]) func(yield func(key string, value T) bool) {
+	return func(yield func(key string, value T) bool) {
 		for key, value := range m.data {
-			select {
-			case <-done:
-				return
-			case ch <- MapRangeEl[T]{Key: key, Value: value}:
+			for _, w := range where {
+				if !w(key, value) {
+					continue
+				}
 			}
-		}
-	}()
-
-	return ch, cancel
-}
-
-func (m *memoryMap[T]) RangeV() (<-chan T, func()) {
-	ch := make(chan T)
-	done := make(chan struct{})
-	cancel := func() {
-		select {
-		case <-done:
-			// channel already closed, no-op
-			return
-		default:
-			close(done)
-		}
-	}
-
-	go func() {
-		defer close(ch)
-		defer close(done)
-		for _, value := range m.data {
-			select {
-			case <-done:
-				return
-			case ch <- value:
+			if !yield(key, value) {
+				break
 			}
-		}
-	}()
-
-	return ch, cancel
-}
-
-func (m *memoryMap[T]) Iterate(yield func(key string, value T) bool) {
-	for key, value := range m.data {
-		if !yield(key, value) {
-			break
 		}
 	}
 }
 
 func (m *memoryMap[T]) Get(key string) (value T, found bool) {
+	m.mut.RLock()
+	defer m.mut.RUnlock()
 	value, found = m.data[key]
 	return
 }
 
 func (m *memoryMap[T]) Find(f func(T) bool) (value T, found bool) {
+	m.mut.RLock()
+	defer m.mut.RUnlock()
 	for _, value = range m.data {
 		if f(value) {
 			found = true
@@ -187,6 +138,8 @@ func (m *memoryMap[T]) Find(f func(T) bool) (value T, found bool) {
 }
 
 func (m *memoryMap[T]) FindAll(f func(T) bool) (values []T) {
+	m.mut.RLock()
+	defer m.mut.RUnlock()
 	for _, value := range m.data {
 		if f(value) {
 			values = append(values, value)
@@ -196,15 +149,21 @@ func (m *memoryMap[T]) FindAll(f func(T) bool) (values []T) {
 }
 
 func (m *memoryMap[T]) Has(key string) bool {
+	m.mut.RLock()
+	defer m.mut.RUnlock()
 	_, ok := m.data[key]
 	return ok
 }
 
 func (m *memoryMap[T]) Set(key string, value T) {
+	m.mut.Lock()
+	defer m.mut.Unlock()
 	m.data[key] = value
 }
 
 func (m *memoryMap[T]) Delete(key string) {
+	m.mut.Lock()
+	defer m.mut.Unlock()
 	delete(m.data, key)
 }
 
@@ -318,14 +277,124 @@ func (m *memoryMap[T]) Write(f func(m *memoryMap[T]) any) any {
 	return f(m)
 }
 
-func (m *memoryMap[T]) ReadE(f func(m *memoryMap[T]) (any, error)) (any, error) {
-	m.RLock()
-	defer m.RUnlock()
-	return f(m)
+func (m *memoryMap[T]) Begin() MapTx[T] {
+	return &memoryMapTx[T]{m, sync.Mutex{}, map[string]*T{}, false, false}
 }
 
-func (m *memoryMap[T]) Read(f func(m *memoryMap[T]) any) any {
-	m.RLock()
-	defer m.RUnlock()
-	return f(m)
+func (tx *memoryMapTx[T]) Get(key string) (value *T, found bool) {
+	tx.mut.Lock()
+	defer tx.mut.Unlock()
+	if v, ok := tx.changes[key]; ok {
+		value = v
+		found = true
+	} else if v, ok := tx.m.data[key]; ok {
+		newValue := v
+		tx.changes[key] = &newValue
+		value = &newValue
+		found = true
+	} else {
+		found = false
+	}
+	return
+}
+
+func (tx *memoryMapTx[T]) Find(f func(T) bool) (value *T, found bool) {
+	tx.mut.Lock()
+	defer tx.mut.Unlock()
+
+	for _, v := range tx.changes {
+		if f(*v) {
+			value = v
+			found = true
+			return
+		}
+	}
+	for key, v := range tx.m.data {
+		if f(v) {
+			// copy the value
+			newValue := v
+			tx.changes[key] = &newValue
+			value = &newValue
+			found = true
+			return
+		}
+	}
+	found = false
+	return
+}
+
+func (tx *memoryMapTx[T]) Has(key string) bool {
+	tx.mut.Lock()
+	defer tx.mut.Unlock()
+	_, ok := tx.changes[key]
+	_, ok2 := tx.m.data[key]
+	return ok || ok2
+}
+
+func (tx *memoryMapTx[T]) Set(key string, value T) {
+	tx.mut.Lock()
+	defer tx.mut.Unlock()
+	tx.changes[key] = &value
+}
+
+func (tx *memoryMapTx[T]) Delete(key string) {
+	tx.mut.Lock()
+	defer tx.mut.Unlock()
+	tx.changes[key] = nil
+}
+
+func (tx *memoryMapTx[T]) Select(where ...MapSelector[T]) func(yield func(key string, value *T) bool) {
+	return func(yield func(key string, value *T) bool) {
+		tx.mut.Lock()
+		defer tx.mut.Unlock()
+		for key, value := range tx.changes {
+			for _, w := range where {
+				if !w(key, *value) {
+					continue
+				}
+			}
+			if !yield(key, value) {
+				break
+			}
+		}
+		for key, value := range tx.m.data {
+			if _, changed := tx.changes[key]; changed {
+				continue
+			}
+			for _, w := range where {
+				if !w(key, value) {
+					continue
+				}
+			}
+			if !yield(key, &value) {
+				break
+			}
+		}
+	}
+}
+
+func (tx *memoryMapTx[T]) Commit() {
+	tx.mut.Lock()
+	defer tx.mut.Unlock()
+	if tx.committed || tx.rolledBack {
+		return
+	}
+	tx.committed = true
+	tx.m.mut.Lock()
+	defer tx.m.mut.Unlock()
+	for key, value := range tx.changes {
+		if value == nil {
+			delete(tx.m.data, key)
+		} else {
+			tx.m.data[key] = *value
+		}
+	}
+	tx.changes = nil
+}
+
+func (tx *memoryMapTx[T]) Rollback() {
+	tx.mut.Lock()
+	defer tx.mut.Unlock()
+	tx.rolledBack = true
+	tx.changes = nil
 }

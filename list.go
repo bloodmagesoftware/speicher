@@ -57,12 +57,6 @@ type (
 		// Len returns the number of elements currently in the List.
 		Len() int
 
-		// Range returns a read-only channel through which the elements of the List can be iterated.
-		// It also returns a cancel function to stop the iteration process if needed.
-		//
-		// Deprecated: use Iterate if you need to iterate over the entire data store.
-		Range() (<-chan T, func())
-
 		// Iterate iterates over the List and calls the provided function for each element.
 		Iterate(yield func(v T) bool)
 
@@ -144,34 +138,6 @@ func (l *memoryList[T]) Overwrite(values []T) {
 
 func (l *memoryList[T]) Len() int {
 	return len(l.data)
-}
-
-func (l *memoryList[T]) Range() (<-chan T, func()) {
-	ch := make(chan T)
-	done := make(chan struct{})
-	cancel := func() {
-		select {
-		case <-done:
-			// channel already closed, no-op
-			return
-		default:
-			close(done)
-		}
-	}
-
-	go func() {
-		defer close(ch)
-		defer close(done)
-		for _, value := range l.data {
-			select {
-			case <-done:
-				return
-			case ch <- value:
-			}
-		}
-	}()
-
-	return ch, cancel
 }
 
 func (l *memoryList[T]) Iterate(yield func(v T) bool) {
