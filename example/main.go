@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/bloodmagesoftware/speicher"
+	"github.com/bloodmagesoftware/speicher/v2"
 )
 
 type Foo struct {
@@ -12,40 +12,37 @@ type Foo struct {
 }
 
 func main() {
-	foo, err := speicher.LoadMap[*Foo]("./data/foo.json")
+	foo, err := speicher.LoadMap[Foo]("./data/foo.json")
 	if err != nil {
 		panic(err)
 	}
 
 	func() {
-		foo.Lock()
-		defer foo.Unlock()
-		foo.Set("a", &Foo{"aaa", 42})
-		foo.Set("b", &Foo{"abc", 69})
+		tx := foo.Begin()
+		defer tx.Rollback()
+		foo.Set("a", Foo{"aaa", 42})
+		foo.Set("b", Foo{"abc", 69})
+		foo.Set("c", Foo{"def", 420})
+		tx.Commit()
 	}()
 
 	func() {
-		foo.RLock()
-		defer foo.RUnlock()
-		ch, close := foo.RangeKV()
-		defer close()
-		for el := range ch {
-			fmt.Printf("%s => (%s, %d)\n", el.Key, el.Value.Bar, el.Value.Baz)
+		for key, value := range foo.Select().Limit(2) { // use the Select method to create an iterator
+			fmt.Printf("%s => (%s, %d)\n", key, value.Bar, value.Baz)
 		}
 	}()
 
 	func() {
-		foo.Lock()
-		defer foo.Unlock()
-		a, ok := foo.Get("a")
+		tx := foo.Begin()
+		defer tx.Rollback()
+		a, ok := tx.Get("a")
 		if ok {
-			a.Baz *= 10
+			a.Baz *= 10 // a.Baz only gets modified because the transaction uses a pointer
 		}
+		tx.Commit()
 	}()
 
 	func() {
-		foo.RLock()
-		defer foo.RUnlock()
 		a, ok := foo.Get("a")
 		if ok {
 			fmt.Printf("changed a => (%s, %d)\n", a.Bar, a.Baz)

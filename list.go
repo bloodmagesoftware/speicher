@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/bloodmagesoftware/speicher/v2/clone"
 )
 
 type (
@@ -22,7 +25,14 @@ type (
 		saveTimer    *time.Timer
 		maxSaveTimer *time.Timer
 		saveOnce     *sync.Once
+		clone        func(T) T
 	}
+
+	ListIterator[T any] func(yield func(v T) bool)
+
+	ListSelector[T any] func(v T) bool
+
+	ListOrderBy[T any] func(a T, b T) bool
 
 	// List is a thread-safe list data store interface that provides basic
 	// CRUD operations, predicate-based search, and iteration functionality.
@@ -57,32 +67,26 @@ type (
 		// Len returns the number of elements currently in the List.
 		Len() int
 
-		// Iterate iterates over the List and calls the provided function for each element.
-		Iterate(yield func(v T) bool)
+		// Select iterates over the List and calls the provided function for each element.
+		Select() ListIterator[T]
 
 		// Save persists the current state of the List to its underlying data store.
 		// It returns an error if the operation fails.
 		Save() error
 
-		// Lock acquires an exclusive lock on the List to ensure thread-safe operations.
-		// Don't forget to use Unlock when you are done.
-		Lock()
+		// Write executes the given function while holding exclusive write lock.
+		Write(f func(l *memoryList[T]) any) any
 
-		// Unlock releases the exclusive lock previously acquired with Lock.
-		Unlock()
-
-		// RLock acquires a read lock on the List to allow concurrent read operations.
-		// Don't forget to use RUnlock when you are done.
-		RLock()
-
-		// RUnlock releases the read lock acquired with RLock.
-		RUnlock()
+		// WriteE executes the given function while holding exclusive write lock.
+		WriteE(f func(l *memoryList[T]) (any, error)) (any, error)
 	}
 )
 
 func (l *memoryList[T]) Get(index int) (value T, found bool) {
+	l.mut.RLock()
+	defer l.mut.RUnlock()
 	if index < 0 || index >= len(l.data) {
-		value = l.data[index]
+		value = l.clone(l.data[index])
 		found = true
 	} else {
 		found = false
@@ -91,10 +95,14 @@ func (l *memoryList[T]) Get(index int) (value T, found bool) {
 }
 
 func (l *memoryList[T]) Append(value T) {
+	l.mut.Lock()
+	defer l.mut.Unlock()
 	l.data = append(l.data, value)
 }
 
 func (l *memoryList[T]) AppendUnique(value T, equal func(a, b T) bool) bool {
+	l.mut.Lock()
+	defer l.mut.Unlock()
 	for _, x := range l.data {
 		if equal(x, value) {
 			return false
@@ -105,9 +113,12 @@ func (l *memoryList[T]) AppendUnique(value T, equal func(a, b T) bool) bool {
 }
 
 func (l *memoryList[T]) Find(f func(T) bool) (value T, found bool) {
-	for _, value = range l.data {
-		if f(value) {
+	l.mut.RLock()
+	defer l.mut.RUnlock()
+	for _, v := range l.data {
+		if f(v) {
 			found = true
+			value = l.clone(v)
 			return
 		}
 	}
@@ -116,15 +127,19 @@ func (l *memoryList[T]) Find(f func(T) bool) (value T, found bool) {
 }
 
 func (l *memoryList[T]) FindAll(f func(T) bool) (values []T) {
+	l.mut.RLock()
+	defer l.mut.RUnlock()
 	for _, value := range l.data {
 		if f(value) {
-			values = append(values, value)
+			values = append(values, l.clone(value))
 		}
 	}
 	return
 }
 
 func (l *memoryList[T]) Set(index int, value T) error {
+	l.mut.Lock()
+	defer l.mut.Unlock()
 	if index < 0 || index >= len(l.data) {
 		return fmt.Errorf("index out of range")
 	}
@@ -133,41 +148,32 @@ func (l *memoryList[T]) Set(index int, value T) error {
 }
 
 func (l *memoryList[T]) Overwrite(values []T) {
+	l.mut.Lock()
+	defer l.mut.Unlock()
 	l.data = values
 }
 
 func (l *memoryList[T]) Len() int {
+	l.mut.RLock()
+	defer l.mut.RUnlock()
 	return len(l.data)
 }
 
-func (l *memoryList[T]) Iterate(yield func(v T) bool) {
-	for _, value := range l.data {
-		if !yield(value) {
-			break
+func (l *memoryList[T]) Select() ListIterator[T] {
+	return func(yield func(v T) bool) {
+		l.mut.RLock()
+		defer l.mut.RUnlock()
+		for _, value := range l.data {
+			if !yield(l.clone(value)) {
+				break
+			}
 		}
 	}
 }
 
-func (l *memoryList[T]) Lock() {
-	l.mut.Lock()
-}
-
-func (l *memoryList[T]) Unlock() {
-	l.mut.Unlock()
-	notifyChanged(l)
-}
-
-func (l *memoryList[T]) RLock() {
-	l.mut.RLock()
-}
-
-func (l *memoryList[T]) RUnlock() {
-	l.mut.RUnlock()
-}
-
 func (l *memoryList[T]) Save() error {
-	l.RLock()
-	defer l.RUnlock()
+	l.mut.RLock()
+	defer l.mut.RUnlock()
 
 	f, err := os.Create(l.location)
 	if err != nil {
@@ -195,6 +201,7 @@ func loadListFromJsonFile[T any](location string) (List[T], error) {
 	l := &memoryList[T]{
 		location: location,
 		data:     make([]T, 0),
+		clone:    clone.CopyConstructor[T](),
 	}
 	f, err := os.Open(location)
 	if err != nil {
@@ -248,25 +255,58 @@ func (l *memoryList[T]) setSaveOnce(o *sync.Once) {
 }
 
 func (l *memoryList[T]) WriteE(f func(l *memoryList[T]) (any, error)) (any, error) {
-	l.Lock()
-	defer l.Unlock()
+	l.mut.Lock()
+	defer l.mut.Unlock()
 	return f(l)
 }
 
 func (l *memoryList[T]) Write(f func(l *memoryList[T]) any) any {
-	l.Lock()
-	defer l.Unlock()
+	l.mut.Lock()
+	defer l.mut.Unlock()
 	return f(l)
 }
 
-func (l *memoryList[T]) ReadE(f func(l *memoryList[T]) (any, error)) (any, error) {
-	l.RLock()
-	defer l.RUnlock()
-	return f(l)
+func (li ListIterator[T]) Where(where ListSelector[T]) ListIterator[T] {
+	return func(yield func(v T) bool) {
+		for value := range li {
+			if !where(value) {
+				continue
+			}
+			if !yield(value) {
+				break
+			}
+		}
+	}
 }
 
-func (l *memoryList[T]) Read(f func(l *memoryList[T]) any) any {
-	l.RLock()
-	defer l.RUnlock()
-	return f(l)
+func (li ListIterator[T]) OrderBy(orderBy ListOrderBy[T]) ListIterator[T] {
+	return func(yield func(v T) bool) {
+		var values []T
+		for value := range li {
+			values = append(values, value)
+		}
+		sort.Slice(values, func(i, j int) bool {
+			return orderBy(values[i], values[j])
+		})
+		for _, value := range values {
+			if !yield(value) {
+				break
+			}
+		}
+	}
+}
+
+func (li ListIterator[T]) Limit(limit int) ListIterator[T] {
+	return func(yield func(v T) bool) {
+		i := 0
+		for value := range li {
+			if i >= limit {
+				break
+			}
+			if !yield(value) {
+				break
+			}
+			i++
+		}
+	}
 }

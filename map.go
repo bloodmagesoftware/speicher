@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/bloodmagesoftware/speicher/v2/clone"
 )
 
 type (
@@ -22,6 +25,7 @@ type (
 		saveTimer    *time.Timer
 		maxSaveTimer *time.Timer
 		saveOnce     *sync.Once
+		clone        func(T) T
 	}
 
 	memoryMapTx[T any] struct {
@@ -31,6 +35,14 @@ type (
 		committed  bool
 		rolledBack bool
 	}
+
+	MapIterator[T any] func(yield func(key string, value T) bool)
+	KVPair[T any]      struct {
+		key   string
+		value T
+	}
+
+	MapOrderBy[T any] func(a KVPair[T], b KVPair[T]) bool
 
 	// MapTx is a read-write transaction for the Map data store. Reading from it will return the changes made in the transaction.
 	MapTx[T any] interface {
@@ -45,7 +57,7 @@ type (
 		// Delete is same as Map.Delete
 		Delete(key string)
 		// Select is same as Map.Select
-		Select(where ...MapSelector[T]) func(yield func(key string, value *T) bool)
+		Select() MapIterator[*T]
 
 		// Commit commits the changes made in the transaction. No-op if the transaction is already committed or rolled back.
 		Commit()
@@ -92,7 +104,7 @@ type (
 		Overwrite(map[string]T)
 
 		// Select iterates over the Map, filters the elements, and calls the provided function for each element until the function returns false.
-		Select(where ...MapSelector[T]) func(yield func(key string, value T) bool)
+		Select() MapIterator[T]
 
 		// Save persists the current state of the data store.
 		// It returns an error if the save operation fails.
@@ -102,14 +114,9 @@ type (
 	MapSelector[T any] func(key string, value T) bool
 )
 
-func (m *memoryMap[T]) Select(where ...MapSelector[T]) func(yield func(key string, value T) bool) {
+func (m *memoryMap[T]) Select() MapIterator[T] {
 	return func(yield func(key string, value T) bool) {
 		for key, value := range m.data {
-			for _, w := range where {
-				if !w(key, value) {
-					continue
-				}
-			}
 			if !yield(key, value) {
 				break
 			}
@@ -171,24 +178,24 @@ func (m *memoryMap[T]) Overwrite(values map[string]T) {
 	m.data = values
 }
 
-func (m *memoryMap[T]) Lock() {
+func (m *memoryMap[T]) lock() {
 	m.mut.Lock()
 }
-func (m *memoryMap[T]) Unlock() {
+func (m *memoryMap[T]) unlock() {
 	m.mut.Unlock()
 	notifyChanged(m)
 }
 
-func (m *memoryMap[T]) RLock() {
+func (m *memoryMap[T]) rLock() {
 	m.mut.RLock()
 }
-func (m *memoryMap[T]) RUnlock() {
+func (m *memoryMap[T]) rUnlock() {
 	m.mut.RUnlock()
 }
 
 func (m *memoryMap[T]) Save() error {
-	m.RLock()
-	defer m.RUnlock()
+	m.rLock()
+	defer m.rUnlock()
 
 	f, err := os.Create(m.location)
 	if err != nil {
@@ -213,7 +220,11 @@ func LoadMap[T any](location string) (Map[T], error) {
 }
 
 func loadMapFromJsonFile[T any](location string) (Map[T], error) {
-	m := &memoryMap[T]{data: map[string]T{}, location: location}
+	m := &memoryMap[T]{
+		data:     map[string]T{},
+		location: location,
+		clone:    clone.CopyConstructor[T](),
+	}
 	f, err := os.Open(location)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -266,14 +277,14 @@ func (m *memoryMap[T]) setSaveOnce(o *sync.Once) {
 }
 
 func (m *memoryMap[T]) WriteE(f func(m *memoryMap[T]) (any, error)) (any, error) {
-	m.Lock()
-	defer m.Unlock()
+	m.lock()
+	defer m.unlock()
 	return f(m)
 }
 
 func (m *memoryMap[T]) Write(f func(m *memoryMap[T]) any) any {
-	m.Lock()
-	defer m.Unlock()
+	m.lock()
+	defer m.unlock()
 	return f(m)
 }
 
@@ -343,16 +354,11 @@ func (tx *memoryMapTx[T]) Delete(key string) {
 	tx.changes[key] = nil
 }
 
-func (tx *memoryMapTx[T]) Select(where ...MapSelector[T]) func(yield func(key string, value *T) bool) {
+func (tx *memoryMapTx[T]) Select() MapIterator[*T] {
 	return func(yield func(key string, value *T) bool) {
 		tx.mut.Lock()
 		defer tx.mut.Unlock()
 		for key, value := range tx.changes {
-			for _, w := range where {
-				if !w(key, *value) {
-					continue
-				}
-			}
 			if !yield(key, value) {
 				break
 			}
@@ -360,11 +366,6 @@ func (tx *memoryMapTx[T]) Select(where ...MapSelector[T]) func(yield func(key st
 		for key, value := range tx.m.data {
 			if _, changed := tx.changes[key]; changed {
 				continue
-			}
-			for _, w := range where {
-				if !w(key, value) {
-					continue
-				}
 			}
 			if !yield(key, &value) {
 				break
@@ -397,4 +398,49 @@ func (tx *memoryMapTx[T]) Rollback() {
 	defer tx.mut.Unlock()
 	tx.rolledBack = true
 	tx.changes = nil
+}
+
+func (mi MapIterator[T]) Where(where MapSelector[T]) MapIterator[T] {
+	return func(yield func(key string, value T) bool) {
+		for key, value := range mi {
+			if !where(key, value) {
+				continue
+			}
+			if !yield(key, value) {
+				break
+			}
+		}
+	}
+}
+
+func (mi MapIterator[T]) OrderBy(orderBy MapOrderBy[T]) MapIterator[T] {
+	return func(yield func(key string, value T) bool) {
+		var kvPairs []KVPair[T]
+		for key, value := range mi {
+			kvPairs = append(kvPairs, KVPair[T]{key: key, value: value})
+		}
+		sort.Slice(kvPairs, func(i, j int) bool {
+			return orderBy(kvPairs[i], kvPairs[j])
+		})
+		for _, kv := range kvPairs {
+			if !yield(kv.key, kv.value) {
+				break
+			}
+		}
+	}
+}
+
+func (mi MapIterator[T]) Limit(limit int) MapIterator[T] {
+	return func(yield func(key string, value T) bool) {
+		i := 0
+		for key, value := range mi {
+			if i >= limit {
+				break
+			}
+			if !yield(key, value) {
+				break
+			}
+			i++
+		}
+	}
 }
