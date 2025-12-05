@@ -14,6 +14,7 @@ import (
 type (
 	// memoryList is a List implementation that keeps all elements in memory.
 	memoryList[T any] struct {
+		id       storeID
 		data     []T
 		location string
 		mut      sync.RWMutex
@@ -26,68 +27,74 @@ type (
 
 	// List is a thread-safe list data store interface that provides basic
 	// CRUD operations, predicate-based search, and iteration functionality.
+	//
+	// All operations require appropriate locking via a State object:
+	//
+	//	s := speicher.NewState()
+	//	s.Lock(myList)
+	//	defer s.Unlock(myList)
+	//	myList.Append(value)
 	List[T any] interface {
+		lockable
+
 		// Get returns the value at a given index of the List and a bool that indicates whether the index exists or not.
 		// If no element is found, the bool result will be false.
+		// Requires at least a read lock.
 		Get(index int) (T, bool)
 
 		// Find traverses the List and returns the first element that satisfies the provided predicate function.
 		// If no element is found, the bool result will be false.
+		// Requires at least a read lock.
 		Find(func(T) bool) (value T, found bool)
 
 		// FindAll returns all elements in the List that satisfy the provided predicate function.
 		// If no elements match, it returns an empty slice.
+		// Requires at least a read lock.
 		FindAll(func(T) bool) (values []T)
 
 		// Append adds the provided value to the end of the List.
+		// Requires a write lock.
 		Append(value T)
 
 		// AppendUnique adds the provided value to the List only if no existing element is equal to it,
 		// based on the supplied equality function. It returns true if the value was added,
 		// and false otherwise.
+		// Requires a write lock.
 		AppendUnique(value T, equal func(a, b T) bool) bool
 
 		// Set assigns the provided value to the element at the specified index.
 		// If the index is out of bounds, it returns an error.
+		// Requires a write lock.
 		Set(index int, value T) error
 
 		// Overwrite replaces the entire List with the data provided in the slice.
+		// Requires a write lock.
 		Overwrite([]T)
 
 		// Len returns the number of elements currently in the List.
+		// Requires at least a read lock.
 		Len() int
 
 		// Range returns a read-only channel through which the elements of the List can be iterated.
 		// It also returns a cancel function to stop the iteration process if needed.
+		// Requires at least a read lock.
 		//
 		// Deprecated: use Iterate if you need to iterate over the entire data store.
 		Range() (<-chan T, func())
 
 		// Iterate iterates over the List and calls the provided function for each element.
+		// Requires at least a read lock.
 		Iterate(yield func(v T) bool)
 
 		// Save persists the current state of the List to its underlying data store.
 		// It returns an error if the operation fails.
+		// This method acquires its own read lock internally.
 		Save() error
-
-		// Lock acquires an exclusive lock on the List to ensure thread-safe operations.
-		// Don't forget to use Unlock when you are done.
-		Lock()
-
-		// Unlock releases the exclusive lock previously acquired with Lock.
-		Unlock()
-
-		// RLock acquires a read lock on the List to allow concurrent read operations.
-		// Don't forget to use RUnlock when you are done.
-		RLock()
-
-		// RUnlock releases the read lock acquired with RLock.
-		RUnlock()
 	}
 )
 
 func (l *memoryList[T]) Get(index int) (value T, found bool) {
-	if index < 0 || index >= len(l.data) {
+	if index >= 0 && index < len(l.data) {
 		value = l.data[index]
 		found = true
 	} else {
@@ -147,22 +154,23 @@ func (l *memoryList[T]) Len() int {
 }
 
 func (l *memoryList[T]) Range() (<-chan T, func()) {
+	// Copy data to a slice to avoid data race with goroutine
+	// The caller is expected to hold a read lock during this call
+	values := make([]T, len(l.data))
+	copy(values, l.data)
+
 	ch := make(chan T)
 	done := make(chan struct{})
+	var closeOnce sync.Once
 	cancel := func() {
-		select {
-		case <-done:
-			// channel already closed, no-op
-			return
-		default:
+		closeOnce.Do(func() {
 			close(done)
-		}
+		})
 	}
 
 	go func() {
 		defer close(ch)
-		defer close(done)
-		for _, value := range l.data {
+		for _, value := range values {
 			select {
 			case <-done:
 				return
@@ -182,31 +190,24 @@ func (l *memoryList[T]) Iterate(yield func(v T) bool) {
 	}
 }
 
-func (l *memoryList[T]) Lock() {
-	l.mut.Lock()
+func (l *memoryList[T]) getStoreID() storeID {
+	return l.id
 }
 
-func (l *memoryList[T]) Unlock() {
-	l.mut.Unlock()
-	notifyChanged(l)
-}
-
-func (l *memoryList[T]) RLock() {
-	l.mut.RLock()
-}
-
-func (l *memoryList[T]) RUnlock() {
-	l.mut.RUnlock()
+func (l *memoryList[T]) getMutex() *sync.RWMutex {
+	return &l.mut
 }
 
 func (l *memoryList[T]) Save() error {
-	l.RLock()
-	defer l.RUnlock()
+	s := NewState()
+	s.RLock(l)
+	defer s.RUnlock(l)
 
 	f, err := os.Create(l.location)
 	if err != nil {
 		return errors.Join(fmt.Errorf("failed to open file '%s'", l.location), err)
 	}
+	defer f.Close()
 	encoder := json.NewEncoder(f)
 	if err := encoder.Encode(l.data); err != nil {
 		return errors.Join(fmt.Errorf("failed to encode json file '%s'", l.location), err)
@@ -227,6 +228,7 @@ func LoadList[T any](location string) (List[T], error) {
 
 func loadListFromJsonFile[T any](location string) (List[T], error) {
 	l := &memoryList[T]{
+		id:       newStoreID(),
 		location: location,
 		data:     make([]T, 0),
 	}
@@ -238,6 +240,7 @@ func loadListFromJsonFile[T any](location string) (List[T], error) {
 		}
 		return nil, errors.Join(fmt.Errorf("failed to open file '%s' (file exists)", location), err)
 	}
+	defer f.Close()
 	decoder := json.NewDecoder(f)
 	if err := decoder.Decode(&l.data); err != nil {
 		return nil, errors.Join(fmt.Errorf("failed to decode json file '%s'", location), err)
@@ -282,25 +285,29 @@ func (l *memoryList[T]) setSaveOnce(o *sync.Once) {
 }
 
 func (l *memoryList[T]) WriteE(f func(l *memoryList[T]) (any, error)) (any, error) {
-	l.Lock()
-	defer l.Unlock()
+	s := NewState()
+	s.Lock(l)
+	defer s.Unlock(l)
 	return f(l)
 }
 
 func (l *memoryList[T]) Write(f func(l *memoryList[T]) any) any {
-	l.Lock()
-	defer l.Unlock()
+	s := NewState()
+	s.Lock(l)
+	defer s.Unlock(l)
 	return f(l)
 }
 
 func (l *memoryList[T]) ReadE(f func(l *memoryList[T]) (any, error)) (any, error) {
-	l.RLock()
-	defer l.RUnlock()
+	s := NewState()
+	s.RLock(l)
+	defer s.RUnlock(l)
 	return f(l)
 }
 
 func (l *memoryList[T]) Read(f func(l *memoryList[T]) any) any {
-	l.RLock()
-	defer l.RUnlock()
+	s := NewState()
+	s.RLock(l)
+	defer s.RUnlock(l)
 	return f(l)
 }
