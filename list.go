@@ -94,7 +94,7 @@ type (
 )
 
 func (l *memoryList[T]) Get(index int) (value T, found bool) {
-	if index < 0 || index >= len(l.data) {
+	if index >= 0 && index < len(l.data) {
 		value = l.data[index]
 		found = true
 	} else {
@@ -154,22 +154,23 @@ func (l *memoryList[T]) Len() int {
 }
 
 func (l *memoryList[T]) Range() (<-chan T, func()) {
+	// Copy data to a slice to avoid data race with goroutine
+	// The caller is expected to hold a read lock during this call
+	values := make([]T, len(l.data))
+	copy(values, l.data)
+
 	ch := make(chan T)
 	done := make(chan struct{})
+	var closeOnce sync.Once
 	cancel := func() {
-		select {
-		case <-done:
-			// channel already closed, no-op
-			return
-		default:
+		closeOnce.Do(func() {
 			close(done)
-		}
+		})
 	}
 
 	go func() {
 		defer close(ch)
-		defer close(done)
-		for _, value := range l.data {
+		for _, value := range values {
 			select {
 			case <-done:
 				return
@@ -206,6 +207,7 @@ func (l *memoryList[T]) Save() error {
 	if err != nil {
 		return errors.Join(fmt.Errorf("failed to open file '%s'", l.location), err)
 	}
+	defer f.Close()
 	encoder := json.NewEncoder(f)
 	if err := encoder.Encode(l.data); err != nil {
 		return errors.Join(fmt.Errorf("failed to encode json file '%s'", l.location), err)
@@ -238,6 +240,7 @@ func loadListFromJsonFile[T any](location string) (List[T], error) {
 		}
 		return nil, errors.Join(fmt.Errorf("failed to open file '%s' (file exists)", location), err)
 	}
+	defer f.Close()
 	decoder := json.NewDecoder(f)
 	if err := decoder.Decode(&l.data); err != nil {
 		return nil, errors.Join(fmt.Errorf("failed to decode json file '%s'", location), err)

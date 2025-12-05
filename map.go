@@ -103,37 +103,29 @@ type (
 )
 
 func (m *memoryMap[T]) RangeKV() (<-chan MapRangeEl[T], func()) {
+	// Copy data to a slice to avoid data race with goroutine
+	// The caller is expected to hold a read lock during this call
+	elements := make([]MapRangeEl[T], 0, len(m.data))
+	for key, value := range m.data {
+		elements = append(elements, MapRangeEl[T]{Key: key, Value: value})
+	}
+
 	ch := make(chan MapRangeEl[T])
 	done := make(chan struct{})
+	var closeOnce sync.Once
 	cancel := func() {
-		select {
-		case <-done:
-			// channel already closed, no-op
-			return
-		default:
-			if done != nil {
-				close(done)
-				done = nil
-			}
-		}
+		closeOnce.Do(func() {
+			close(done)
+		})
 	}
 
 	go func() {
-		defer func() {
-			if done != nil {
-				close(done)
-				done = nil
-			}
-			if ch != nil {
-				close(ch)
-				ch = nil
-			}
-		}()
-		for key, value := range m.data {
+		defer close(ch)
+		for _, el := range elements {
 			select {
 			case <-done:
 				return
-			case ch <- MapRangeEl[T]{Key: key, Value: value}:
+			case ch <- el:
 			}
 		}
 	}()
@@ -142,22 +134,25 @@ func (m *memoryMap[T]) RangeKV() (<-chan MapRangeEl[T], func()) {
 }
 
 func (m *memoryMap[T]) RangeV() (<-chan T, func()) {
+	// Copy data to a slice to avoid data race with goroutine
+	// The caller is expected to hold a read lock during this call
+	values := make([]T, 0, len(m.data))
+	for _, value := range m.data {
+		values = append(values, value)
+	}
+
 	ch := make(chan T)
 	done := make(chan struct{})
+	var closeOnce sync.Once
 	cancel := func() {
-		select {
-		case <-done:
-			// channel already closed, no-op
-			return
-		default:
+		closeOnce.Do(func() {
 			close(done)
-		}
+		})
 	}
 
 	go func() {
 		defer close(ch)
-		defer close(done)
-		for _, value := range m.data {
+		for _, value := range values {
 			select {
 			case <-done:
 				return
@@ -236,6 +231,7 @@ func (m *memoryMap[T]) Save() error {
 	if err != nil {
 		return errors.Join(fmt.Errorf("failed to open file '%s'", m.location), err)
 	}
+	defer f.Close()
 	encoder := json.NewEncoder(f)
 	if err := encoder.Encode(m.data); err != nil {
 		return errors.Join(fmt.Errorf("failed to encode json file '%s'", m.location), err)
@@ -264,6 +260,7 @@ func loadMapFromJsonFile[T any](location string) (Map[T], error) {
 		}
 		return nil, errors.Join(fmt.Errorf("failed to open file '%s' (but exists)", location), err)
 	}
+	defer f.Close()
 	decoder := json.NewDecoder(f)
 	if err := decoder.Decode(&m.data); err != nil {
 		return nil, errors.Join(fmt.Errorf("failed to decode json file '%s'", location), err)

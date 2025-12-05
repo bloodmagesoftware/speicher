@@ -22,6 +22,7 @@ Version 2 introduces a `State` object that manages locks per goroutine, enabling
 ### Basic Lock Changes
 
 **v1 (old):**
+
 ```go
 foo.Lock()
 defer foo.Unlock()
@@ -29,6 +30,7 @@ foo.Set("key", value)
 ```
 
 **v2 (new):**
+
 ```go
 s := speicher.NewState()
 s.Lock(foo)
@@ -39,6 +41,7 @@ foo.Set("key", value)
 ### Read Lock Changes
 
 **v1 (old):**
+
 ```go
 foo.RLock()
 defer foo.RUnlock()
@@ -46,6 +49,7 @@ value, ok := foo.Get("key")
 ```
 
 **v2 (new):**
+
 ```go
 s := speicher.NewState()
 s.RLock(foo)
