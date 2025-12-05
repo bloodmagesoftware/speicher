@@ -10,7 +10,7 @@
 //	import (
 //		"fmt"
 //
-//		"github.com/bloodmagesoftware/speicher"
+//		"github.com/bloodmagesoftware/speicher/v2"
 //	)
 //
 //	type Foo struct {
